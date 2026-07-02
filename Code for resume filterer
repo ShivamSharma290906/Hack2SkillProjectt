@@ -1,0 +1,204 @@
+import tempfile
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+import streamlit as st
+import zipfile
+import os
+import io  # Excel processing ke liye zaroori hai
+import pandas as pd  # Excel DataFrame banane ke liye
+from pdf2image import convert_from_path
+import pytesseract
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Users\Shivam\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+from langchain_core.documents import Document
+from groq import Groq
+import time
+
+st.set_page_config(page_title="Understanding Streamlit / Application Uploader")
+st.write("refresh to upload new documents!")
+st.title("Get the Right Man For Your Job!")
+# Add some vertical space
+st.write("")
+st.write("")
+source_directory = st.file_uploader(label="", type=['zip'], key='zip_uploader', label_visibility='collapsed')
+st.markdown("Drag or Drop your zip file", unsafe_allow_html=True)
+
+if source_directory is not None:
+    job_description = st.text_input("Job Description")
+    required_skills = st.text_input("Required Skills")
+    years_of_experience = st.text_input("Years of Experience")
+    top_n = st.slider("Show top results", 1, 5)
+    find_button = st.button('Find')
+
+    if job_description and required_skills and years_of_experience and find_button:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = os.path.join(temp_dir, "uploaded.zip")
+
+            with open(zip_path, "wb") as f:
+                f.write(source_directory.read())  # opening the zip file
+
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)  # extracting the temp_dir
+
+            # Saare PDF paths collect karo
+            pdf_paths = []
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file.lower().endswith('.pdf'):
+                        pdf_paths.append(os.path.join(root, file))
+
+            st.write(f"Total CVs found: {len(pdf_paths)}")
+
+            # Har PDF ka text nikalo using OCR
+            raw_documents = []
+            for path in pdf_paths:
+                try:
+                    images = convert_from_path(path,
+                                               poppler_path=r"C:\Poppler\poppler-26.02.0\Library\bin")  # converts pdf to digital image
+                    file_text = ""
+                    for img in images:
+                        file_text += pytesseract.image_to_string(img) + "\n"
+                    if file_text.strip():
+                        raw_documents.append(Document(
+                            page_content=file_text,
+                            metadata={"source": path, "filename": os.path.basename(path)}
+                        ))
+                except Exception as e:
+                    st.write(f"Skipped: {os.path.basename(path)} — {str(e)}")
+
+            st.write(f"Successfully extracted text from {len(raw_documents)} CVs")
+
+            # chunking
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=4000,
+                chunk_overlap=250
+            )
+
+            docs = text_splitter.split_documents(raw_documents)
+
+            embedding_model = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={'device': 'cpu'}
+            )
+
+            vector_db = Chroma.from_documents(
+                documents=docs,
+                embedding=embedding_model
+            )
+
+            client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+
+            def get_llm_summary(resume_text):
+                prompt = (
+                        "You are a recruiter. Read this resume and write EXACTLY 2-3 crisp lines "
+                        "about this candidate — their role and top skills. "
+                        f"Evaluate and give results strictly on the basis of {job_description}, {required_skills} and {years_of_experience}"
+                        f"give candidates more than {years_of_experience}"
+                        "Only mention years of experience if EXPLICITLY written as a number. "
+                        "If multiple experience durations are mentioned, always state the TOTAL/OVERALL experience first."
+                        "No bullet points. No intro line. Start with job title or candidate name.\n\n"
+                        + resume_text[:4000]
+                )
+                try:
+                    response = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=150
+                    )
+                    return response.choices[0].message.content.strip()
+                except Exception as e:
+                    return f"Summary failed: {str(e)}"
+
+
+            # Search
+            full_query = f"{job_description} {required_skills} {years_of_experience}".strip()
+            results = vector_db.similarity_search_with_score(full_query, k=20)
+
+            seen = set()
+            count = 0
+
+            display_data = []
+            excel_rows = []  # Excel ka data collect karne ke liye array
+
+            for doc, score in results:
+                fname = doc.metadata.get("filename", "unknown.pdf")
+                fpath = doc.metadata.get("source", "")
+
+                if fname in seen:
+                    continue
+                seen.add(fname)
+                count += 1
+
+                percentage = round((1 - score) * 100, 2)
+
+                with st.spinner("Generating summary..."):
+                    summary = get_llm_summary(doc.page_content)
+                    time.sleep(1)
+
+                pdf_bytes = None
+                if os.path.exists(fpath):
+                    with open(fpath, 'rb') as f:
+                        pdf_bytes = f.read()
+
+                display_data.append({
+                    "fname": fname,
+                    "percentage": percentage,
+                    "summary": summary,
+                    "pdf_bytes": pdf_bytes
+                })
+
+                # Excel row data collection
+                excel_rows.append({
+                    "Rank": count,
+                    "Candidate File": fname,
+                    "Match Score (%)": percentage,
+                    "Recruiter Summary": summary
+                })
+
+                if count == top_n:
+                    break
+
+            del vector_db
+
+            st.session_state.display_data = display_data
+
+            # Excel file preparation in memory buffer
+            if excel_rows:
+                df = pd.DataFrame(excel_rows)
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df.to_excel(writer, index=False, sheet_name='Ranked Candidates')
+                st.session_state.excel_bytes = buffer.getvalue()
+
+# --- UI DISPLAY SECTION ---
+if "display_data" in st.session_state:
+
+    # Ranked Output File download option
+    if "excel_bytes" in st.session_state:
+        st.success("📊 Ranking complete! Excel report is ready.")
+        st.download_button(
+            label="📊 Download Ranked Candidates List (Excel)",
+            data=st.session_state.excel_bytes,
+            file_name="ranked_candidates.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.markdown("---")
+
+    for i, item in enumerate(st.session_state.display_data, start=1):
+        st.markdown(f"### #{i} 📄 {item['fname']}")
+        st.markdown(f"Match Score: {item['percentage']}%")
+        st.progress(min(max(item['percentage'] / 100, 0), 1.0))
+        st.info(item['summary'])
+
+        if item['pdf_bytes'] is not None:
+            st.download_button(
+                label=f"📥 Download {item['fname']}",
+                data=item['pdf_bytes'],
+                file_name=item['fname'],
+                mime="application/pdf",
+                key=f"dl_{i}"
+            )
+
+        st.markdown("---")
